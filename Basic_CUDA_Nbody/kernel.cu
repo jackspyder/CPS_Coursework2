@@ -5,7 +5,8 @@
 
 // Kernel function to add the elements of two arrays
 __global__
-void add(int n, float *x, float *y)
+
+void add(int n, float* x, float* y)
 {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
