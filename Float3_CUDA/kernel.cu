@@ -10,10 +10,10 @@
 constexpr float softening = 1e-9f; //define softening value
 constexpr float t_step = 0.001f; //define timestep
 constexpr int n_iters = 10; //define number of iterations
-constexpr int n_bodies = 200000; //define number of bodies
+constexpr int n_bodies = 12500; //define number of bodies
 constexpr int block_size = 128; //define block size
 
-//define body struct using float4
+								//define body struct using float4
 typedef struct
 {
 	float3 *pos, *vel;
@@ -136,7 +136,7 @@ int main()
 		looptime = looptime_stop - looptime_start;
 		looptime_total += looptime_stop - looptime_start;
 		std::cout << "Iteration: " << j << " runtime: " << looptime.count() << " seconds" << std::endl;
-		
+
 	}
 
 	//calculate and display run statistics

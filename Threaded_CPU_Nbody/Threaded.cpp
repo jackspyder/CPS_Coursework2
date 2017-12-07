@@ -11,8 +11,8 @@
 constexpr float softening = 1e-9f; //define softening value
 constexpr float m = 1.0f; //define mass
 constexpr float t_step = 0.001f; //define timestep
-constexpr int n_iters = 5; //define number of iterations
-constexpr int n_bodies = 64000; //define number of bodies
+constexpr int n_iters = 10; //define number of iterations
+constexpr int n_bodies = 12500; //define number of bodies
 
 //Define Body structure
 typedef struct
@@ -67,6 +67,7 @@ void body_force(Body* p, const int n)
 
 void body_position(const int n, Body *p)
 {
+#pragma omp parallel for schedule(guided)
 	for (int i = 0; i < n_bodies; i++)
 	{
 		p[i].x += p[i].vx * t_step;
@@ -84,6 +85,7 @@ int main()
 	std::chrono::duration<double> forcetime_total;
 	std::chrono::duration<double> positontime_total;
 	std::chrono::duration<double> looptime;
+	std::chrono::duration<double> initial;
 
 	int bytes = n_bodies * sizeof(Body);
 
@@ -98,7 +100,7 @@ int main()
 	{
 		//cudaEventRecord(looptime_start);//start cuda looptimer
 		auto const looptime_start = std::chrono::high_resolution_clock::now();
-		
+		if (iter == 1) { initial = looptime_start - runtime_start; }
 		//body_force call and timers
 		auto const forcetime_start = std::chrono::high_resolution_clock::now();
 		body_force(planets, n_bodies);
@@ -115,18 +117,20 @@ int main()
 		auto const looptime_stop = std::chrono::high_resolution_clock::now();
 		looptime = looptime_stop - looptime_start;
 		looptime_total += looptime_stop - looptime_start;
-		std::cout << "Iteration: " << iter << " runtime: " << looptime.count() << "seconds" << std::endl;
+		std::cout << "Iteration: " << iter << " runtime: " << looptime.count() << " seconds" << std::endl;
 	}
 	
 	//calculate and display run statistics
 	auto const runtime_stop = std::chrono::high_resolution_clock::now();
 	runtime_total = runtime_stop - runtime_start;
+	std::cout << "Number of bodies calculated: " << n_bodies << std::endl;
+	std::cout << "Total Run time: " << runtime_total.count() << " seconds" << std::endl;
+	std::cout << "Initialize time: " << initial.count() << " seconds" << std::endl;
+	std::cout << "Execution time: " << runtime_total.count() - initial.count() << " seconds" << std::endl;
+	std::cout << "Average iteration time: " << looptime_total.count() / n_iters << std::endl;
+	std::cout << "Iterations per second: " << n_iters / looptime_total.count() << std::endl;
 	std::cout << "Force Bandwidth (MB/s): " << 2 * bytes / (forcetime_total.count() / n_iters) / 1000000 << std::endl;
 	std::cout << "Positon Bandwidth (GB/s): " << 2 * bytes / (positontime_total.count() / n_iters) / 1e+9 << std::endl;
-	std::cout << "Total Runtime for iterations 1 through " << n_iters << ": " << runtime_total.count() << " seconds" << std::endl;
-	std::cout << "Number of bodies calculated: " << n_bodies << std::endl;
-	std::cout << "Average iteration time: " << looptime_total.count()/ n_iters << std::endl;
-	std::cout << "Iterations per second: " << n_iters / runtime_total.count() << std::endl;
 
 	//clear memory
 	free(data);

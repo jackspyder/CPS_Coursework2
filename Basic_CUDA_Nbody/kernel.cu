@@ -1,63 +1,155 @@
-#include <iostream>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <iostream>
+#include <chrono>
 
-// Kernel function to add the elements of two arrays
-__global__
+//Define Global Variables
+constexpr float softening = 1e-9f; //define softening value
+constexpr float t_step = 0.001f; //define timestep
+constexpr int n_iters = 10; //define number of iterations
+constexpr int n_bodies = 12500; //define number of bodies
+constexpr int block_size = 128; //define block size
 
-void add(int n, float* x, float* y)
+								//Define Body structure
+typedef struct
 {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	int stride = blockDim.x * gridDim.x;
-	for (int i = index; i < n; i += stride)
-		y[i] = x[i] + y[i];
+	float x, y, z, vx, vy, vz;
+} Body;
+
+//Generate random body values
+void randomize_bodies(float* data, const int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		data[i] = 2.0f * (rand() / (float)RAND_MAX) - 1.0f; //assign random float between 1 and -1
+	}
 }
 
-int main(void)
+//GPU Kernel that calculates forces on each body.
+__global__
+
+void body_force(Body* p, const int n)
 {
-	int N = 1 << 20;
-	float *x, *y;
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-
-	// Allocate Unified Memory – accessible from CPU or GPU
-	cudaMallocManaged(&x, N * sizeof(float));
-	cudaMallocManaged(&y, N * sizeof(float));
-
-	// initialize x and y arrays on the host
-	for (int i = 0; i < N; i++)
+	//Work out grid size and use as index.
+	const int i = blockDim.x * blockIdx.x + threadIdx.x;
+	if (i < n)
 	{
-		x[i] = 1.0f;
-		y[i] = 2.0f;
+		//clear any previous forces.
+		float Fx = 0.0f;
+		float Fy = 0.0f;
+		float Fz = 0.0f;
+
+		for (int j = 0; j < n; j++)
+		{
+			//calculate distances between two bodies.
+			const float dx = p[j].x - p[i].x;
+			const float dy = p[j].y - p[i].y;
+			const float dz = p[j].z - p[i].z;
+			//square distances and add a softening factor
+			const float dist_sqr = dx * dx + dy * dy + dz * dz + softening;
+			const float inv_dist = rsqrtf(dist_sqr);
+			const float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+			//calculate the forces for each dimension on a body
+			Fx += dx * inv_dist3;
+			Fy += dy * inv_dist3;
+			Fz += dz * inv_dist3;
+		}
+
+		//add the resulting velocities to the body.
+		p[i].vx += t_step * Fx;
+		p[i].vy += t_step * Fy;
+		p[i].vz += t_step * Fz;
+	}
+}
+
+void body_position(const int n, Body *p)
+{
+	for (int i = 0; i < n_bodies; i++)
+	{
+		p[i].x += p[i].vx * t_step;
+		p[i].y += p[i].vy * t_step;
+		p[i].z += p[i].vz * t_step;
+	}
+}
+
+int main()
+{
+	//Declare timer events.
+	auto const runtime_start = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> runtime_total;
+	std::chrono::duration<double> looptime_total;
+	std::chrono::duration<double> forcetime_total;
+	std::chrono::duration<double> positontime_total;
+	std::chrono::duration<double> looptime;
+	std::chrono::duration<double> initial;
+
+	int bytes = n_bodies * sizeof(Body);
+
+	//calculate number of thread blocks
+	int blocks = (n_bodies + block_size - 1) / block_size;
+
+	//Pointers for data and planets.
+	float* data;
+	Body* planets;
+
+	//allocate unified memory for data and planets
+	cudaMallocManaged(&data, bytes);
+	cudaMallocManaged(&planets, bytes);
+
+	//cast data to planets
+	planets = reinterpret_cast<Body*>(data);
+
+	//generate initial pos/vel data
+	randomize_bodies(data, 6 * n_bodies);
+
+	//loop for number of iterations
+	for (int j = 1; j <= n_iters; j++)
+	{
+		//cudaEventRecord(looptime_start);//start cuda looptimer
+		auto const looptime_start = std::chrono::high_resolution_clock::now();
+		if (j == 1) { initial = looptime_start - runtime_start; }
+		//body_force call and timers
+		auto const forcetime_start = std::chrono::high_resolution_clock::now();
+		body_force << <blocks, block_size >> >(planets, n_bodies);
+
+
+		//wait for GPU to finish before acessing results
+		cudaDeviceSynchronize();
+		auto const forcetime_stop = std::chrono::high_resolution_clock::now();
+		forcetime_total += forcetime_stop - forcetime_start;
+
+		//body_position call and timers
+		auto const positiontime_start = std::chrono::high_resolution_clock::now();
+		body_position(n_bodies, planets);
+		auto const positiontime_stop = std::chrono::high_resolution_clock::now();
+		positontime_total += positiontime_stop - positiontime_start;
+
+		//calculate and display iteration number and iteration runtime.
+		auto const looptime_stop = std::chrono::high_resolution_clock::now();
+		looptime = looptime_stop - looptime_start;
+		looptime_total += looptime_stop - looptime_start;
+		std::cout << "Iteration: " << j << " runtime: " << looptime.count() << " seconds" << std::endl;
 	}
 
-	// Run kernel on 1M elements on the GPU
-	int blockSize = 256;
-	int numBlocks = (N + blockSize - 1) / blockSize;
-	cudaEventRecord(start);
-	add << <numBlocks, blockSize >> >(N, x, y);
-	cudaEventRecord(stop);
+	//calculate and display run statistics
+	auto const runtime_stop = std::chrono::high_resolution_clock::now();
+	runtime_total = runtime_stop - runtime_start;
+	std::cout << "Number of bodies calculated: " << n_bodies << std::endl;
+	std::cout << "Total Run time: " << runtime_total.count() << " seconds" << std::endl;
+	std::cout << "Initialize time: " << initial.count() << " seconds" << std::endl;
+	std::cout << "Execution time: " << runtime_total.count() - initial.count() << " seconds" << std::endl;
+	std::cout << "Average iteration time: " << looptime_total.count() / n_iters << std::endl;
+	std::cout << "Iterations per second: " << n_iters / looptime_total.count() << std::endl;
+	std::cout << "Force Bandwidth (MB/s): " << 2 * bytes / (forcetime_total.count() / n_iters) / 1000000 << std::endl;
+	std::cout << "Positon Bandwidth (GB/s): " << 2 * bytes / (positontime_total.count() / n_iters) / 1e+9 << std::endl;
 
-	// Wait for GPU to finish before accessing on host
-	cudaDeviceSynchronize();
-
-
-	cudaEventSynchronize(stop);
-	float milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-
-	// Check for errors (all values should be 3.0f)
-	float maxError = 0.0f;
-	for (int i = 0; i < N; i++)
-		maxError = fmax(maxError, fabs(y[i] - 3.0f));
-	std::cout << "Max error: " << maxError << std::endl;
-	std::cout << "Effective bandwidth(GB/s): " << N * 4 * 3 / milliseconds / 0x3E8 << std::endl;
-	std::cout << N << std::endl;
-	// Free memory
-	cudaFree(x);
-	cudaFree(y);
+	//clear memory
+	cudaFree(planets);
+	cudaFree(data);
 
 	return 0;
 }
