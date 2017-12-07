@@ -8,22 +8,21 @@
 
 //Define Global Variables
 constexpr float softening = 1e-9f; //define softening value
-constexpr float m = 1.0f; //define mass
 constexpr float t_step = 0.001f; //define timestep
-constexpr int n_iters = 10; //define number of iterations
-constexpr int n_bodies = 200000; //define number of bodies
+constexpr int n_iters = 500; //define number of iterations
+constexpr int n_bodies = 64000; //define number of bodies
 constexpr int block_size = 128; //define block size
 
 //define body struct using float4
 typedef struct
 {
-	float4 *pos, *vel;
-} BodySystem;
+	float3 *pos, *vel;
+} Body;
 
 //Generate random body values
-void randomize_bodies(float* data, const int n)
+void randomize_bodies(float *data, const int n)
 {
-	for (auto i = 0; i < n; i++)
+	for (int i = 0; i < n; i++)
 	{
 		data[i] = 2.0f * (rand() / (float)RAND_MAX) - 1.0f; //assign random float between 1 and -1
 	}
@@ -32,7 +31,7 @@ void randomize_bodies(float* data, const int n)
 //GPU Kernel that calculates forces on each body.
 __global__
 
-void body_force(float4* p, float4* v, const int n)
+void body_force(float3 *p, float3 *v, const int n)
 {
 	//Work out grid size and use as index.
 	const int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -43,7 +42,7 @@ void body_force(float4* p, float4* v, const int n)
 		float Fy = 0.0f;
 		float Fz = 0.0f;
 
-		for (auto j = 0; j < n; j++)
+		for (int j = 0; j < n; j++)
 		{
 			//calculate distances between two bodies.
 			const float dx = p[j].x - p[i].x;
@@ -67,81 +66,88 @@ void body_force(float4* p, float4* v, const int n)
 	}
 }
 
+void body_position(const int n, float3* p, float3* v)
+{
+	for (int i = 0; i < n_bodies; i++)
+	{
+		p[i].x += v[i].x * t_step;
+		p[i].y += v[i].y * t_step;
+		p[i].z += v[i].z * t_step;
+	}
+
+
+}
 
 int main()
 {
-	//start chrono timer
-	auto const startT = std::chrono::high_resolution_clock::now();
+	//Declare timer events.
+	auto const runtime_start = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> runtime_total;
+	std::chrono::duration<double> looptime_total;
+	std::chrono::duration<double> forcetime_total;
+	std::chrono::duration<double> positontime_total;
+	std::chrono::duration<double> looptime;
 
-	//pre calculate bytes for easy memory allocation
-	const int bytes = 2 * n_bodies * sizeof(float4);
 
-	//pointer and memory alocation for data, declare planets
-	float* data = (float*)malloc(bytes);
-	const BodySystem planets = {(float4*)data, ((float4*)data) + n_bodies};
-
-	//randomise body data
-	randomize_bodies(data, 8 * n_bodies); // Init pos / vel data
-
-	//pointer for device data and allocate device memory
-	float* d_data;
-	cudaMalloc(&d_data, bytes);
-	const BodySystem d_planets = {(float4*)d_data, ((float4*)d_data) + n_bodies};
+	int bytes = 2 * n_bodies * sizeof(float3);
 
 	//calculate number of thread blocks
-	auto n_blocks = (n_bodies + block_size - 1) / block_size;
+	int blocks = (n_bodies + block_size - 1) / block_size;
 
-	float average = 0;
+	//Pointers for data and planets.
+	float* data;
 
-	//main loop
-	for (auto iter = 1; iter <= n_iters; iter++)
+	cudaMallocManaged(&data, bytes);
+
+	Body planets = { (float3*)data, ((float3*)data) + n_bodies };
+
+
+
+	//allocate unified memory for data and planets
+
+	cudaMallocManaged(&planets.pos, bytes);
+	cudaMallocManaged(&planets.vel, bytes);
+
+	//generate initial pos/vel data
+	randomize_bodies(data, 5 * n_bodies);
+
+	//loop for number of iterations
+	for (int j = 1; j <= n_iters; j++)
 	{
-		//cuda kernel timer
-		cudaEvent_t start, stop;
-		cudaEventCreate(&start);
-		cudaEventCreate(&stop);
+		//cudaEventRecord(looptime_start);//start cuda looptimer
+		auto const looptime_start = std::chrono::high_resolution_clock::now();
 
-		//copy from host ot device memory
-		cudaMemcpy(d_data, data, bytes, cudaMemcpyHostToDevice);
+		//body_force call and timers
+		auto const forcetime_start = std::chrono::high_resolution_clock::now();
+		body_force << <blocks, block_size >> >(planets.pos, planets.vel, n_bodies);
+		cudaDeviceSynchronize();
+		auto const forcetime_stop = std::chrono::high_resolution_clock::now();
+		forcetime_total += forcetime_stop - forcetime_start;
 
-		//time and execute body_force kernel
-		cudaEventRecord(start);//start cuda timer
-		body_force << <n_blocks, block_size >> >(d_planets.pos, d_planets.vel, n_bodies);
-		cudaEventRecord(stop);//end cuda timer
 
-		//return data from device
-		cudaMemcpy(data, d_data, bytes, cudaMemcpyDeviceToHost);
-
-		// integrate position data
-		for (auto i = 0; i < n_bodies; i++)
-		{
-			planets.pos[i].x += planets.vel[i].x * t_step;
-			planets.pos[i].y += planets.vel[i].y * t_step;
-			planets.pos[i].z += planets.vel[i].z * t_step;
-		}
+		//body_position call and timers
+		auto const positiontime_start = std::chrono::high_resolution_clock::now();
+		body_position(n_bodies, planets.pos, planets.vel);
+		auto const positiontime_stop = std::chrono::high_resolution_clock::now();
+		positontime_total += positiontime_stop - positiontime_start;
 
 		//calculate and display iteration number and iteration runtime.
-		cudaEventSynchronize(stop);
-		float milliseconds = 0;
-		cudaEventElapsedTime(&milliseconds, start, stop);
-		std::cout << "Iteration: " << iter << " runtime: " << milliseconds << "ms" << std::endl;
-		average += milliseconds;
-		if (iter == n_iters)
-		{
-			//display bandwidth on last lteration only, to avoid spam.
-			average = average / n_iters;
-			std::cout << "Average effective bandwidth(MB/s): " << n_bodies * sizeof(BodySystem) * 2 / average / 0x3E8 << std::
-				endl;
-		}
+		auto const looptime_stop = std::chrono::high_resolution_clock::now();
+		looptime = looptime_stop - looptime_start;
+		looptime_total += looptime_stop - looptime_start;
+		std::cout << "Iteration: " << j << " runtime: " << looptime.count() << "seconds" << std::endl;
+		
 	}
-	//calculate total run time.
-	auto const finishT = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> totalTime = finishT - startT;
-	std::cout << "Total Run time for iterations 1 through " << n_iters << ": " << totalTime.count() << " seconds" << std::
-		endl;
+
+	//calculate and display run statistics
+	auto const runtime_stop = std::chrono::high_resolution_clock::now();
+	runtime_total = runtime_stop - runtime_start;
+	std::cout << "Force Bandwidth (MB/s): " << 2 * bytes / (forcetime_total.count() / n_iters) / 1000000 << std::endl;
+	std::cout << "Positon Bandwidth (GB/s): " << 2 * bytes / (positontime_total.count() / n_iters) / 1e+9 << std::endl;
+	std::cout << "Total Runtime for iterations 1 through " << n_iters << ": " << runtime_total.count() << " seconds" << std::endl;
 	std::cout << "Number of bodies calculated: " << n_bodies << std::endl;
-	std::cout << "Iterations per second: " << n_iters / totalTime.count() << std::endl;
-	//clear data
-	cudaFree(d_data);
-	free(data);
+	std::cout << "Average iteration time: " << looptime_total.count() / n_iters << std::endl;
+	std::cout << "Iterations per second: " << n_iters / runtime_total.count() << std::endl;
+
+	return 0;
 }
